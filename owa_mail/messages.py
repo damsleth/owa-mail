@@ -1,0 +1,195 @@
+"""Message JSON shaping.
+
+Pure functions only. Outlook REST returns PascalCase with nested
+`EmailAddress` objects; we flatten to a snake_case shape that's stable
+for `--pretty`, JSON consumers and our own internal use. Build helpers
+go the other way: from CLI flags to the Outlook payload shape.
+"""
+from . import scheduled as scheduled_mod
+
+
+def _addr(rec):
+    """Pull a flat email address out of an EmailAddress wrapper.
+
+    Outlook returns `{"EmailAddress": {"Address": "...", "Name": "..."}}`
+    for sender / recipient slots; we surface just the address."""
+    if not isinstance(rec, dict):
+        return ''
+    inner = rec.get('EmailAddress') or rec.get('emailAddress') or {}
+    return inner.get('Address') or inner.get('address') or ''
+
+
+def _addrs(items):
+    if not isinstance(items, list):
+        return ''
+    out = [_addr(x) for x in items]
+    return ', '.join(a for a in out if a)
+
+
+def _flag_status(flag):
+    if not isinstance(flag, dict):
+        return ''
+    return flag.get('FlagStatus') or flag.get('flagStatus') or ''
+
+
+def normalize_message(raw):
+    """Flatten one Outlook REST message to our snake_case shape.
+
+    Body is omitted from list output (`messages` listing) but included
+    on `show`. Callers requesting a single message pass `include_body=True`.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    body = raw.get('Body') or raw.get('body') or {}
+    return {
+        'id': raw.get('Id') or raw.get('id') or '',
+        'conversation_id': raw.get('ConversationId') or raw.get('conversationId') or '',
+        'received': raw.get('ReceivedDateTime') or raw.get('receivedDateTime') or '',
+        'sent': raw.get('SentDateTime') or raw.get('sentDateTime') or '',
+        'subject': raw.get('Subject') or raw.get('subject') or '',
+        'from': _addr(raw.get('From') or raw.get('from') or {}),
+        'to': _addrs(raw.get('ToRecipients') or raw.get('toRecipients') or []),
+        'cc': _addrs(raw.get('CcRecipients') or raw.get('ccRecipients') or []),
+        'bcc': _addrs(raw.get('BccRecipients') or raw.get('bccRecipients') or []),
+        'preview': raw.get('BodyPreview') or raw.get('bodyPreview') or '',
+        'is_read': bool(raw.get('IsRead', raw.get('isRead', False))),
+        'has_attachments': bool(raw.get('HasAttachments', raw.get('hasAttachments', False))),
+        'importance': raw.get('Importance') or raw.get('importance') or '',
+        'flag': _flag_status(raw.get('Flag') or raw.get('flag') or {}),
+        'folder_id': raw.get('ParentFolderId') or raw.get('parentFolderId') or '',
+        'web_link': raw.get('WebLink') or raw.get('webLink') or '',
+        'body_type': body.get('ContentType') or body.get('contentType') or '',
+        'body': body.get('Content') or body.get('content') or '',
+    }
+
+
+def normalize_messages(raw):
+    items = raw.get('value', []) if isinstance(raw, dict) else []
+    out = []
+    for m in items:
+        flat = normalize_message(m)
+        # Drop body fields from list view to keep payloads tight.
+        flat.pop('body', None)
+        flat.pop('body_type', None)
+        out.append(flat)
+    return out
+
+
+def _split_addrs(value):
+    """Split a comma- or semicolon-separated address string into a list,
+    dropping empties. Whitespace is trimmed."""
+    if not value:
+        return []
+    parts = []
+    for chunk in value.replace(';', ',').split(','):
+        s = chunk.strip()
+        if s:
+            parts.append(s)
+    return parts
+
+
+def _to_recipient_array(addrs):
+    return [{'EmailAddress': {'Address': a}} for a in addrs]
+
+
+def _importance_value(value):
+    """Normalise importance string to Outlook's casing. None / empty
+    means "unset" - the caller drops the key entirely."""
+    if not value:
+        return None
+    v = value.strip().lower()
+    if v in ('low', 'normal', 'high'):
+        return v.capitalize()
+    raise ValueError(f'invalid importance: {value} (use low|normal|high)')
+
+
+def build_message_body(to, cc, bcc, subject, body, html, importance=''):
+    """Build the `Message` substructure shared by send / draft.
+
+    Recipient inputs are comma/semicolon-separated strings; outputs are
+    Outlook's nested-object arrays. body is treated as text by default;
+    `html=True` switches ContentType to HTML so Outlook renders markup
+    instead of escaping it.
+    """
+    if not subject:
+        raise ValueError('--subject is required')
+    to_list = _split_addrs(to)
+    if not to_list:
+        raise ValueError('--to is required (one or more addresses)')
+    msg = {
+        'Subject': subject,
+        'Body': {
+            'ContentType': 'HTML' if html else 'Text',
+            'Content': body or '',
+        },
+        'ToRecipients': _to_recipient_array(to_list),
+    }
+    cc_list = _split_addrs(cc)
+    if cc_list:
+        msg['CcRecipients'] = _to_recipient_array(cc_list)
+    bcc_list = _split_addrs(bcc)
+    if bcc_list:
+        msg['BccRecipients'] = _to_recipient_array(bcc_list)
+    imp = _importance_value(importance)
+    if imp:
+        msg['Importance'] = imp
+    return msg
+
+
+def build_send_payload(message_body):
+    """Wrap a Message body for the one-shot `/me/sendMail` endpoint."""
+    return {'Message': message_body, 'SaveToSentItems': True}
+
+
+def build_draft_payload(message_body, send_at=None):
+    """Build the body for `POST /me/messages` (creates a Draft).
+
+    If `send_at` is set we attach the PR_DEFERRED_SEND_TIME extended
+    property so Exchange Transport holds the message in Outbox until
+    the scheduled time.
+    """
+    payload = dict(message_body)
+    if send_at:
+        payload['SingleValueExtendedProperties'] = (
+            scheduled_mod.build_deferred_send_props(send_at)
+        )
+    return payload
+
+
+def build_reply_patch(body, html, send_at=None, extra_to=None):
+    """Build the PATCH body used to fill in a createReply / createReplyAll
+    / createForward draft before sending.
+
+    `body=None` means "leave the draft body alone"; any other value
+    becomes the Body content. `html` switches ContentType when a body is
+    supplied. For forward, `extra_to` overrides the (empty)
+    ToRecipients on the draft.
+    """
+    patch = {}
+    if body is not None:
+        patch['Body'] = {
+            'ContentType': 'HTML' if html else 'Text',
+            'Content': body or '',
+        }
+    if extra_to:
+        patch['ToRecipients'] = _to_recipient_array(_split_addrs(extra_to))
+    if send_at:
+        patch['SingleValueExtendedProperties'] = (
+            scheduled_mod.build_deferred_send_props(send_at)
+        )
+    return patch
+
+
+def build_mark_patch(read=None, flag=None):
+    """Build the PATCH body for `mark`. Caller passes booleans for
+    read (True/False) and flag (True=Flagged, False=NotFlagged), or
+    None to leave a field untouched.
+    """
+    patch = {}
+    if read is not None:
+        patch['IsRead'] = bool(read)
+    if flag is not None:
+        patch['Flag'] = {
+            'FlagStatus': 'Flagged' if flag else 'NotFlagged'
+        }
+    return patch
