@@ -7,7 +7,7 @@ name = "owa-mail"
 version = "0.1.0"
 description = "Pipe-friendly mail CLI for Outlook / Microsoft 365"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "MIT"
 dependencies = ["owa-piggy>=0.6.0"]
 keywords = [
@@ -27,7 +27,6 @@ classifiers = [
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
